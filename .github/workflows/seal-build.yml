@@ -1,0 +1,154 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows,
+# against both Go releases supported when v0.45.0 shipped (go.mod: go 1.24.0).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Go package pattern(s) to test instead of ./...'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have (upstream ships no .github).
+      # .gitignore and .gitattributes are kept: they ARE part of the published
+      # module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.24', '1.25']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      # The hosted Linux runner ships with IPv6 off on loopback and ICMP "ping"
+      # sockets restricted; the ipv4/ipv6/icmp suites skip themselves on each
+      # of those. Turn them on so those tests run instead of skipping.
+      # (The loopback MULTICAST flag is deliberately left off: forcing it on
+      # makes ipv4's source-specific-multicast subtest wait forever for a
+      # looped-back packet the runner's kernel never delivers.)
+      - name: Configure Linux network stack for the network tests
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo | grep -q '::1' || sudo ip -6 addr add ::1/128 dev lo
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip addr show dev lo
+
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go build ./...
+
+      # -json so every test event (run/pass/fail/skip and the output lines that
+      # belong to it, including each skip's reason) is attributed to its test;
+      # the human-readable -v text is replayed from it below. The exit status
+      # of `go test` is propagated unchanged.
+      - name: Test
+        run: |
+          set -uo pipefail
+          status=0
+          go test -json ${{ inputs.test-filter || './...' }} > "$RUNNER_TEMP/go-test.json" || status=$?
+          jq -j 'select(.Action == "output" or .Action == "build-output") | .Output' "$RUNNER_TEMP/go-test.json"
+          echo "go test exit status: $status"
+          exit $status
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -eu
+          J="$RUNNER_TEMP/go-test.json"
+          echo "==== skipped tests and the reason each one gave ===="
+          jq -r -s '
+            (map(select(.Test != null and .Action == "output"))
+              | group_by([.Package, .Test])
+              | map({key: (.[0].Package + " " + .[0].Test),
+                     value: (map(.Output) | join(""))})
+              | from_entries) as $out
+            | map(select(.Test != null and .Action == "skip"))[]
+            | . as $e
+            | ($out[$e.Package + " " + $e.Test] // ""
+                | split("\n")
+                | map(select(length > 0 and (test("^\\s*(=== |--- )") | not)))) as $why
+            | "SKIP \($e.Package) \($e.Test)\n"
+              + (if ($why | length) == 0 then "    reason: (subtest skipped by its parent; see parent output)"
+                 else ($why | map("    reason: " + sub("^\\s+"; "")) | join("\n")) end)
+          ' "$J"
+          echo
+          echo "Note: 'not supported on <os>/<arch>' skips in golang.org/x/net/ipv4, ipv6 and icmp come from"
+          echo "nettest.SupportsRawSocket(): raw IP sockets need root, and the suite runs as the unprivileged runner user."
+          echo "'avoid external network' / 'skipping external network test' skips are the suite's own opt-in guards"
+          echo "(icmp -diag and http2 -extnet flags, off by default) for tests that reach hosts on the public internet."
+          echo "'no available interface' multicast skips: the hosted runner has no up, multicast-capable loopback interface."
+          echo
+          echo "==== per-package results ===="
+          jq -r 'select(.Test == null and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | "\(.Action)\t\(.Package)"' "$J"
+          echo "==== go test summary ===="
+          jq -r -s '
+            "packages ok: \(map(select(.Test == null and .Action == "pass")) | length), packages FAIL: \(map(select(.Test == null and .Action == "fail")) | length)",
+            "tests passed: \(map(select(.Test != null and .Action == "pass")) | length), failed: \(map(select(.Test != null and .Action == "fail")) | length), skipped: \(map(select(.Test != null and .Action == "skip")) | length)"
+          ' "$J"
